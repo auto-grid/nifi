@@ -20,16 +20,20 @@ package org.apache.nifi.processors.kite;
 
 import static org.apache.nifi.processor.util.StandardValidators.createLongValidator;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.LinkedList;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.avro.Schema;
 import org.apache.avro.file.DataFileWriter;
 import org.apache.avro.generic.GenericData.Record;
-import org.apache.commons.lang3.StringEscapeUtils;
+import org.apache.commons.text.StringEscapeUtils;
 import org.apache.nifi.annotation.behavior.InputRequirement;
 import org.apache.nifi.annotation.behavior.InputRequirement.Requirement;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
@@ -41,6 +45,7 @@ import org.apache.nifi.components.ValidationResult;
 import org.apache.nifi.components.Validator;
 import org.apache.nifi.expression.ExpressionLanguageScope;
 import org.apache.nifi.flowfile.FlowFile;
+import org.apache.nifi.flowfile.attributes.CoreAttributes;
 import org.apache.nifi.processor.ProcessContext;
 import org.apache.nifi.processor.ProcessSession;
 import org.apache.nifi.processor.Relationship;
@@ -58,7 +63,6 @@ import org.kitesdk.data.spi.filesystem.CSVProperties;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
-import java.util.concurrent.atomic.AtomicLong;
 
 @Tags({"kite", "csv", "avro"})
 @InputRequirement(Requirement.INPUT_REQUIRED)
@@ -97,6 +101,11 @@ public class ConvertCSVToAvro extends AbstractKiteConvertProcessor {
         .name("incompatible")
         .description("CSV content that could not be converted")
         .build();
+
+    private static final Relationship INVALID = new Relationship.Builder()
+            .name("invalid")
+            .description("CSV records that could not be converted")
+            .build();
 
     @VisibleForTesting
     static final PropertyDescriptor SCHEMA = new PropertyDescriptor.Builder()
@@ -177,6 +186,7 @@ public class ConvertCSVToAvro extends AbstractKiteConvertProcessor {
         .add(SUCCESS)
         .add(FAILURE)
         .add(INCOMPATIBLE)
+        .add(INVALID)
         .build();
 
     @Override
@@ -228,9 +238,12 @@ public class ConvertCSVToAvro extends AbstractKiteConvertProcessor {
 
             try {
                 final AtomicLong written = new AtomicLong(0L);
+                final AtomicLong failedIndex = new AtomicLong(0L); // added to get the index of the failed records
                 final FailureTracker failures = new FailureTracker();
+                List<Long> invalidRecordList = new LinkedList<Long>(); // store index of the failed records
 
                 FlowFile badRecords = session.clone(incomingCSV);
+                FlowFile invalidRecords = session.create(badRecords); //FlowFile that will carry our invalid records
                 FlowFile outgoingAvro = session.write(incomingCSV, new StreamCallback() {
                     @Override
                     public void process(InputStream in, OutputStream out) throws IOException {
@@ -240,11 +253,13 @@ public class ConvertCSVToAvro extends AbstractKiteConvertProcessor {
                             try (DataFileWriter<Record> w = writer.create(schema, out)) {
                                 while (reader.hasNext()) {
                                     try {
-                                        Record record = reader.next();
+                                    	failedIndex.incrementAndGet();
+                                    	Record record = reader.next();
                                         w.append(record);
                                         written.incrementAndGet();
                                     } catch (DatasetRecordException e) {
                                         failures.add(e);
+                                        invalidRecordList.add(failedIndex.get());
                                     }
                                 }
                             }
@@ -260,6 +275,9 @@ public class ConvertCSVToAvro extends AbstractKiteConvertProcessor {
                     false /* update only if file transfer is successful */);
 
                 if (written.get() > 0L) {
+                    outgoingAvro = session.putAttribute(outgoingAvro, CoreAttributes.MIME_TYPE.key(), InferAvroSchema.AVRO_MIME_TYPE);
+                    outgoingAvro = session.putAttribute(outgoingAvro, "records.total", String.valueOf(errors + written.get())); //
+                    outgoingAvro = session.putAttribute(outgoingAvro, "records.invalid", String.valueOf(errors)); //
                     session.transfer(outgoingAvro, SUCCESS);
 
                     if (errors > 0L) {
@@ -268,8 +286,20 @@ public class ConvertCSVToAvro extends AbstractKiteConvertProcessor {
                         badRecords = session.putAttribute(
                             badRecords, "errors", failures.summary());
                         session.transfer(badRecords, INCOMPATIBLE);
-                    } else {
+
+                        /* Changes to represent invalid records from the input file.
+                         * */
+                        invalidRecords = session.putAttribute(
+                        		invalidRecords, "errors", failures.summary());
+                        invalidRecords = session.putAttribute(
+                        		invalidRecords, "records.invalid", String.valueOf(errors));
+                        invalidRecords = session.putAttribute(
+                        		invalidRecords, "records.invalid.index", invalidRecordList.toString());
+
+                        session.transfer(invalidRecords, INVALID);
+                    }  else {
                         session.remove(badRecords);
+                        session.remove(invalidRecords);
                     }
 
                 } else {
@@ -285,6 +315,7 @@ public class ConvertCSVToAvro extends AbstractKiteConvertProcessor {
                             badRecords, "errors", "No incoming records");
                     }
 
+                    session.remove(invalidRecords);
                     session.transfer(badRecords, FAILURE);
                 }
 
